@@ -13,3 +13,4 @@ scipy
 h5py
 timm
 einops
+Pillow

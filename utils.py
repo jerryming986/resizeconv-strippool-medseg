@@ -60,6 +60,31 @@ class DiceLoss(nn.Module):
         return loss / self.n_classes
 
 
+def update_confusion(stats, pred, gt):
+    """累加二分类混淆矩阵（前景=1）。stats 为 [TP,FP,TN,FN] 的可变 list，pred/gt 为 {0,1} 数组。
+    用全像素累加(micro)汇总，得到与 MALUNet/EGE-UNet 一致的全局 DSC/IoU/Acc/Sen/Spe。"""
+    p = pred.astype(bool)
+    g = gt.astype(bool)
+    stats[0] += int(np.logical_and(p, g).sum())     # TP
+    stats[1] += int(np.logical_and(p, ~g).sum())    # FP
+    stats[2] += int(np.logical_and(~p, ~g).sum())   # TN
+    stats[3] += int(np.logical_and(~p, g).sum())    # FN
+    return stats
+
+
+def isic_metrics_from_confusion(stats):
+    """由 [TP,FP,TN,FN] 计算皮肤病灶分割常用指标（前景类）。"""
+    tp, fp, tn, fn = stats
+    eps = 1e-7
+    return {
+        'DSC': 2 * tp / (2 * tp + fp + fn + eps),       # Dice / F1
+        'IoU': tp / (tp + fp + fn + eps),               # Jaccard / mIoU(前景)
+        'Acc': (tp + tn) / (tp + tn + fp + fn + eps),   # 像素准确率
+        'Sen': tp / (tp + fn + eps),                    # 敏感度 / 召回
+        'Spe': tn / (tn + fp + eps),                    # 特异度
+    }
+
+
 def calculate_metric_percase(pred, gt):
     pred[pred > 0] = 1
     gt[gt > 0] = 1
@@ -74,6 +99,7 @@ def calculate_metric_percase(pred, gt):
 
 
 def test_single_volume(image, label, net, classes, patch_size=[256, 256], test_save_path=None, case=None, z_spacing=1):
+    device = next(net.parameters()).device
     image, label = image.squeeze(0).cpu().detach().numpy(), label.squeeze(0).cpu().detach().numpy()
     if len(image.shape) == 3:
         prediction = np.zeros_like(label)
@@ -82,7 +108,7 @@ def test_single_volume(image, label, net, classes, patch_size=[256, 256], test_s
             x, y = slice.shape[0], slice.shape[1]
             if x != patch_size[0] or y != patch_size[1]:
                 slice = zoom(slice, (patch_size[0] / x, patch_size[1] / y), order=3)  # previous using 0
-            input = torch.from_numpy(slice).unsqueeze(0).unsqueeze(0).float().cuda()
+            input = torch.from_numpy(slice).unsqueeze(0).unsqueeze(0).float().to(device)
             net.eval()
             with torch.no_grad():
                 outputs = net(input)
@@ -95,7 +121,7 @@ def test_single_volume(image, label, net, classes, patch_size=[256, 256], test_s
                 prediction[ind] = pred
     else:
         input = torch.from_numpy(image).unsqueeze(
-            0).unsqueeze(0).float().cuda()
+            0).unsqueeze(0).float().to(device)
         net.eval()
         with torch.no_grad():
             out = torch.argmax(torch.softmax(net(input), dim=1), dim=1).squeeze(0)

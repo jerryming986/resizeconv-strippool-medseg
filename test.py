@@ -18,7 +18,7 @@ try:
 except Exception:
     ACDC_dataset = None
 from networks.vision_transformer import SwinUnet as ViT_seg
-from utils import test_single_volume
+from utils import test_single_volume, update_confusion, isic_metrics_from_confusion
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str,
@@ -72,6 +72,36 @@ if args.dataset == "Synapse":
     # 测试卷位于 test_vol_h5/ 下；与 train.py 对 train_npz 的处理保持一致
     args.root_path = os.path.join(args.root_path, "test_vol_h5")
 config = get_config(args)
+
+
+def inference_isic(args, model, test_save_path=None):
+    """ISIC2017/2018 二分类逐图推理：在 val(=30% 测试集)上按全像素累加混淆矩阵，
+    输出全局 DSC/IoU/Acc/Sen/Spe（micro，与 MALUNet/EGE-UNet 一致）+ 逐图平均 DSC。
+    is_savenii 时把预测掩码存成 0/255 的 PNG，供定性图使用。"""
+    from datasets.dataset_isic import ISIC_dataset
+    db_test = ISIC_dataset(base_dir=args.volume_path, split='val', img_size=args.img_size)
+    testloader = DataLoader(db_test, batch_size=1, shuffle=False, num_workers=1)
+    logging.info("{} test images".format(len(db_test)))
+    model.eval()
+    stats = [0, 0, 0, 0]
+    per_image_dsc = []
+    for i_batch, sampled_batch in tqdm(enumerate(testloader), total=len(testloader)):
+        image = sampled_batch['image'].cuda()
+        label = sampled_batch['label'].squeeze(0).numpy()
+        case_name = sampled_batch['case_name'][0]
+        with torch.no_grad():
+            out = torch.argmax(torch.softmax(model(image), dim=1), dim=1).squeeze(0).cpu().numpy()
+        update_confusion(stats, out, label)
+        inter = np.logical_and(out == 1, label == 1).sum()
+        denom = int((out == 1).sum() + (label == 1).sum())
+        per_image_dsc.append(2.0 * inter / (denom + 1e-7))
+        if test_save_path is not None:
+            from PIL import Image
+            Image.fromarray((out * 255).astype(np.uint8)).save(os.path.join(test_save_path, case_name + '_pred.png'))
+    m = isic_metrics_from_confusion(stats)
+    logging.info('Testing performance: DSC : %f IoU : %f Acc : %f Sen : %f Spe : %f mean_imgDice : %f' % (
+        m['DSC'], m['IoU'], m['Acc'], m['Sen'], m['Spe'], float(np.mean(per_image_dsc))))
+    return "Testing Finished!"
 
 
 def inference(args, model, test_save_path=None):
@@ -160,7 +190,10 @@ if __name__ == "__main__":
         os.makedirs(test_save_path, exist_ok=True)
     else:
         test_save_path = None
-    inference(args, net, test_save_path)
+    if args.dataset in ('ISIC2017', 'ISIC2018'):
+        inference_isic(args, net, test_save_path)
+    else:
+        inference(args, net, test_save_path)
 
 # python train.py --dataset Synapse --cfg $CFG --root_path $DATA_DIR --max_epochs $EPOCH_TIME --output_dir $OUT_DIR --img_size $IMG_SIZE --base_lr $LEARNING_RATE --batch_size $BATCH_SIZE
 # python train.py --output_dir './model_out/datasets' --dataset datasets --img_size 224 --batch_size 32 --cfg configs/swin_tiny_patch4_window7_224_lite.yaml --root_path /media/aicvi/11111bdb-a0c7-4342-9791-36af7eb70fc0/NNUNET_OUTPUT/nnunet_preprocessed/Dataset001_mm/nnUNetPlans_2d_split

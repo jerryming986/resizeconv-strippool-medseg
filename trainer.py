@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 
-from utils import DiceLoss
+from utils import DiceLoss, update_confusion, isic_metrics_from_confusion
 
 
 # EMA（权重指数滑动平均）配置：对训练后段的权重做滑动平均，平滑「只测最后一个 epoch」带来的抖动。
@@ -64,6 +64,23 @@ class ModelEMA:
 
 
 @torch.no_grad()
+def validate_isic(model, loader, num_classes):
+    """ISIC 二分类验证：对 val 集全像素累加混淆矩阵，返回全局 DSC/IoU/Acc/Sen/Spe（micro）。
+    用 model_without_ddp(原始权重)评估并据 DSC 存 best_model.pth；EMA 另存 ema.pth 由 test.py 选测。"""
+    was_training = model.training
+    model.eval()
+    stats = [0, 0, 0, 0]
+    for sampled_batch in loader:
+        image = sampled_batch['image'].cuda()
+        label = sampled_batch['label'].numpy()
+        out = torch.argmax(torch.softmax(model(image), dim=1), dim=1).cpu().numpy()
+        for b in range(out.shape[0]):
+            update_confusion(stats, out[b], label[b])
+    model.train(was_training)
+    return isic_metrics_from_confusion(stats)
+
+
+@torch.no_grad()
 def log_bim_status(model, probe_image, writer, iter_num):
     """监控 BIM 模块的「激活程度」，每个 epoch 记一次（无 BIM 时直接返回，零开销）：
       (1) |gamma_bim| —— 学到的门控强度（初值 0 或 BIM_GAMMA0，越大说明 BIM 介入越深）；
@@ -106,11 +123,18 @@ def trainer_synapse(args, model, snapshot_path):
     num_classes = args.num_classes
     batch_size = args.batch_size * args.n_gpu
     # 数据集切换：ACDC 用专属 .h5 加载器(BaseDataSets)，其余沿用 Synapse_dataset。
+    db_val = None   # 仅 ISIC 有验证集(=测试 30%)，用于每个 epoch 选 best_model.pth
     if args.dataset == 'ACDC':
         from datasets.dataset_acdc import BaseDataSets, RandomGenerator
         db_train = BaseDataSets(base_dir=args.root_path, split="train",
                                 transform=transforms.Compose(
                                     [RandomGenerator([args.img_size, args.img_size])]))
+    elif args.dataset in ('ISIC2017', 'ISIC2018'):
+        from datasets.dataset_isic import ISIC_dataset, RandomGenerator
+        db_train = ISIC_dataset(base_dir=args.root_path, split='train', img_size=args.img_size,
+                                transform=transforms.Compose(
+                                    [RandomGenerator([args.img_size, args.img_size])]))
+        db_val = ISIC_dataset(base_dir=args.root_path, split='val', img_size=args.img_size)
     else:
         from datasets.dataset_synapse import Synapse_dataset, RandomGenerator
         db_train = Synapse_dataset(base_dir=args.root_path, list_dir=args.list_dir, split="train",
@@ -124,6 +148,8 @@ def trainer_synapse(args, model, snapshot_path):
     train_loader = DataLoader(db_train, batch_size=batch_size, shuffle=True, num_workers=args.num_workers,
                               pin_memory=True,
                               worker_init_fn=worker_init_fn)
+    val_loader = DataLoader(db_val, batch_size=batch_size, shuffle=False, num_workers=args.num_workers,
+                            pin_memory=True) if db_val is not None else None
     if args.n_gpu > 1:
         model = nn.DataParallel(model)
     # 取未包 DataParallel 的底层模型：EMA 从它建立、向它取参，保存的 state_dict 无 'module.' 前缀，
@@ -134,6 +160,9 @@ def trainer_synapse(args, model, snapshot_path):
     # ACDC 标准：0.5·CE + 0.5·Dice，且 CE 忽略 label=4 的 padding 像素；Synapse：0.4·CE + 0.6·Dice。
     if args.dataset == 'ACDC':
         ce_loss = CrossEntropyLoss(ignore_index=4)
+        ce_w, dice_w = 0.5, 0.5
+    elif args.dataset in ('ISIC2017', 'ISIC2018'):
+        ce_loss = CrossEntropyLoss()      # 2 类(背景/病灶)，CE 即等价 BCE
         ce_w, dice_w = 0.5, 0.5
     else:
         ce_loss = CrossEntropyLoss()
@@ -175,6 +204,7 @@ def trainer_synapse(args, model, snapshot_path):
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     writer = SummaryWriter(snapshot_path + '/log')
     iter_num = 0
+    best_dsc = -1.0   # ISIC: 跟踪 val 最佳 DSC 以保存 best_model.pth
     max_epoch = args.max_epochs
     max_iterations = args.max_epochs * len(train_loader)  # max_epoch = max_iterations // len(trainloader) + 1
     # E1：AdamW 配线性 warmup（默认 20 epoch，可由 WARMUP_EPOCHS 调短），之后 cosine 衰减到 0
@@ -239,6 +269,18 @@ def trainer_synapse(args, model, snapshot_path):
             epoch_num, batch_loss, batch_ce_loss, batch_dice_loss))
         if probe_image is not None:
             log_bim_status(model_without_ddp, probe_image, writer, iter_num)   # 监控 BIM 激活程度
+        # ISIC：每个 epoch 在 val(=30% 测试集)上评估，按 DSC 保存 best_model.pth（test.py 默认加载它）。
+        if val_loader is not None:
+            vm = validate_isic(model_without_ddp, val_loader, num_classes)
+            writer.add_scalar('val/DSC', vm['DSC'], iter_num)
+            writer.add_scalar('val/IoU', vm['IoU'], iter_num)
+            logging.info('Val epoch %d: DSC=%.4f IoU=%.4f Acc=%.4f Sen=%.4f Spe=%.4f'
+                         % (epoch_num, vm['DSC'], vm['IoU'], vm['Acc'], vm['Sen'], vm['Spe']))
+            if vm['DSC'] > best_dsc:
+                best_dsc = vm['DSC']
+                best_path = os.path.join(snapshot_path, 'best_model.pth')
+                torch.save(model_without_ddp.state_dict(), best_path)
+                logging.info('  -> new best val DSC=%.4f, saved %s' % (best_dsc, best_path))
         # Synapse 为 18 训练 / 12 测试的官方协议，无验证集：不做验证，按固定 epoch 训练，
         # 定期保存 checkpoint；训练结束后用 test.py 在 12 例测试集上评测 Dice/HD95。
         # 最终 epoch 存为 epoch_{max_epoch-1}.pth，与 test.py 的默认查找名一致。
