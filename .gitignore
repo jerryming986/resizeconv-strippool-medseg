@@ -1,0 +1,29 @@
+# 训练产物 / 下载的大权重 —— 断点只存代码，不存这些
+pretrained_ckpt/
+model_out/
+predictions/
+test_log/
+
+# checkpoints / 数据二进制
+*.pth
+*.pt
+*.ckpt
+*.npz
+*.h5
+
+# python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 本地工具状态
+.claude/
+.obsidian/
+
+# 生成的图预览(PNG 仅预览,脚本可重建;PDF/SVG 作为成图保留跟踪)
+figures/*.png
+
+# PDF 导出的中间产物与成品(由 make_reading_copy.py / build_pdf.sh 重建)
+paper_reading_copy.md
+paper_pdf_build.md
+paper_draft.pdf

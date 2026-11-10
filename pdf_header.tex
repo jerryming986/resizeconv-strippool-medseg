@@ -1,0 +1,14 @@
+% glyphs Latin Modern lacks -> font-independent LaTeX symbols (work in text & math)
+\usepackage{newunicodechar}
+\usepackage{amssymb}
+\usepackage{pifont}
+\newunicodechar{↑}{\ensuremath{\uparrow}}
+\newunicodechar{↓}{\ensuremath{\downarrow}}
+\newunicodechar{→}{\ensuremath{\rightarrow}}
+\newunicodechar{−}{\ensuremath{-}}
+\newunicodechar{Δ}{\ensuremath{\Delta}}
+\newunicodechar{✓}{\ding{51}}
+\newunicodechar{✗}{\ding{55}}
+% keep the wide per-organ table within the page
+\usepackage{etoolbox}
+\AtBeginEnvironment{longtable}{\footnotesize}
